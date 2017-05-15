@@ -9,10 +9,11 @@ int main()
 	softmax classifier;
 	classifier.useGPU(1);
 	int batch_count = 50;
-
+	clock_t start, finish;
+	long timeused = 0;
 	classifier.cleanup_Resize(10, mnist.getWidth()*mnist.getHeight());
 	classifier.setLearningRate(0.00001);
-	for (int count = 0; count < 50000; count++)
+	for (int count = 0; count < 10001; count++)
 	{
 		unsigned char* input;
 		unsigned char* type = mnist.getBatchFromTrainSet(batch_count, &input);
@@ -30,9 +31,16 @@ int main()
 			label[i] = type[i];
 		}
 		delete[] type;
+		start = clock();
 		float correct_rate = classifier.updatePara(x, label, batch_count,0);
-		if(count % 1000 == 0)
+		finish = clock();
+		timeused += finish - start;
+		if (count % 1000 == 0)
+		{
 			std::cout << "training " << count << " times, correct rate is " << correct_rate << std::endl;
+			std::cout << "update parameters cost " << timeused << "ms per trace" << std::endl;
+			timeused = 0;
+		}
 		delete[]x;
 		delete[] label;
 	}
@@ -61,5 +69,5 @@ int main()
 	}
 	*/
 
-	system("pause");
+//	system("pause");
 }

@@ -4,7 +4,7 @@
 #include "device_functions.h"
 #include <stdio.h>
 
-#define SIZE 512
+#define SIZE 1024
 
 #define ONERROR(expression)  cudaStatus = expression;\
 if(cudaStatus != cudaSuccess) \
@@ -22,18 +22,21 @@ __global__ void multiply(int categories, int features,int batches, float* W, flo
 	float Wx_plus_b;
 	float result;
 
-	__shared__ float temp[SIZE];//SIZE * categories
-	temp[feature % SIZE] = 0;
+	int init = threadIdx.x;
+	__shared__ float temp[SIZE];
+	while (init < SIZE)
+	{
+		temp[init] = 0;
+		init += blockDim.x;
+	}
 
 	__syncthreads();
 
-
-
 	{
 		Wx = W[feature + category * features] * input[feature + batch * features];
-		temp[feature % SIZE] += Wx;
+		temp[feature] += Wx;
 		__syncthreads();
-		for (int thread = SIZE / 2; thread > 0; thread /= 2)
+		for (int thread = 1024 / 2; thread > 32; thread /= 2)
 		{
 			if (threadIdx.x < thread)
 			{
@@ -42,20 +45,40 @@ __global__ void multiply(int categories, int features,int batches, float* W, flo
 			__syncthreads();
 		}
 
-		score[category + categories * batch] = temp[0];
+		if (threadIdx.x < 16)
+		{
+			volatile float* volatiletemp = temp;
+			volatiletemp[threadIdx.x] += volatiletemp[threadIdx.x + 32];
+			volatiletemp[threadIdx.x] += volatiletemp[threadIdx.x + 16];
+			volatiletemp[threadIdx.x] += volatiletemp[threadIdx.x + 8];
+			volatiletemp[threadIdx.x] += volatiletemp[threadIdx.x + 4];
+			volatiletemp[threadIdx.x] += volatiletemp[threadIdx.x + 2];
+			volatiletemp[threadIdx.x] += volatiletemp[threadIdx.x + 1];
+			if (threadIdx.x == 0)
+				score[category + categories * batch] = volatiletemp[0];
+		}
 
 	}
 }
-__global__ void update(int categories, int features, int batches, float* W, float* b, float* input, int* labels,float* score,float learningRate)
+__global__ void update1(int categories, int features, int batches, int* labels,float* score,float* diff)
 {
 	int category = threadIdx.x;
 	int batch = blockIdx.x;
-	extern __shared__ float diff[];
+//	extern __shared__ float diff[];
 	__shared__ float temp[SIZE];
-	diff[category] = exp(score[category + batch * categories]);
-	temp[category % SIZE] = 0;
+
+	diff[category + batch * categories] = exp(score[category + batch * categories]);
+
+	int init = threadIdx.x;
+	while (init < SIZE)
+	{
+		temp[init] = 0;
+		init += blockDim.x;
+	}
 	__syncthreads();
-	temp[category % SIZE] += diff[category];
+
+
+	temp[category] += diff[category + batch * categories];
 	__syncthreads();
 	for (int thread = SIZE / 2; thread > 0; thread /= 2)
 	{
@@ -65,17 +88,37 @@ __global__ void update(int categories, int features, int batches, float* W, floa
 		}
 		__syncthreads();
 	}
-	diff[category] /= temp[0];
+
+	diff[category + batch * categories] /= temp[0];
 	if (category == labels[batch])
-		diff[category]--;
-	__syncthreads();
-	for (int feature = 0; feature < features; feature++)
-	{
-		W[feature + category*features] -= learningRate * diff[category] * input[feature + batch * features];
-	}
-	b[category] -= learningRate * diff[category];
+		diff[category + batch * categories]--;
 }
 
+__global__ void update2(int categories, int features, int batches,float* input, float* diff,float* diffW)
+{
+	int category = threadIdx.x;
+	int batch = threadIdx.y;
+	int feature = blockIdx.x;
+	//	extern __shared__ float diff[];
+	diffW[category + categories*batch + feature*categories*batches] = diff[category + batch * categories] * input[feature + batch * features];
+}
+
+__global__ void update3(int categories, int features, int batches, float* W, float* b, float* diff, float* diffW,float learningRate)
+{
+	int feature = threadIdx.x;
+	int category = blockIdx.x;
+	float batchDiffW = 0;
+	float batchDiffb = 0;
+	for (int batch = 0; batch < batches; batch++)
+	{
+		batchDiffW += learningRate * diffW[category + categories*batch + feature*categories*batches];
+		if (feature == 0)
+			batchDiffb += learningRate * diff[category + categories* batch];
+	}
+	W[feature + features * category] -= batchDiffW;
+	if (feature == 0)
+		b[category] -= batchDiffb;
+}
 
 
 
@@ -105,12 +148,18 @@ cudaError_t updatePara_SGD(float* x, int* label, int batches, float* backPropaga
 	float* dev_x;
 	float* dev_score;
 	float* host_score = new float[categories * batches];
+	float* dev_diff;
+	float* dev_diffW;
 	int* dev_labels;
+	cudaStream_t stream0;
+	ONERROR(cudaStreamCreate(&stream0));
 	ONERROR(cudaMalloc(&dev_x,sizeof(float)*features*batches));
 	ONERROR(cudaMalloc(&dev_labels, sizeof(int)*batches));
-	ONERROR(cudaMemcpy(dev_x, x, sizeof(float)*features*batches, cudaMemcpyHostToDevice));
-	ONERROR(cudaMemcpy(dev_labels, label, sizeof(int)*batches, cudaMemcpyHostToDevice));
+	ONERROR(cudaMemcpyAsync(dev_x, x, sizeof(float)*features*batches, cudaMemcpyHostToDevice, stream0));
+	ONERROR(cudaMemcpyAsync(dev_labels, label, sizeof(int)*batches, cudaMemcpyHostToDevice, stream0));
 	ONERROR(cudaMalloc(&dev_score, sizeof(float)*categories*batches));
+	ONERROR(cudaMalloc(&dev_diff, sizeof(float)*categories*batches));
+	ONERROR(cudaMalloc(&dev_diffW, sizeof(float)*categories*batches*features));
 /*
 	struct cudaDeviceProp properties;
 	cudaGetDeviceProperties(&properties, 0);
@@ -119,23 +168,46 @@ cudaError_t updatePara_SGD(float* x, int* label, int batches, float* backPropaga
 
 	dim3 gridShape = dim3(categories, batches);
 	dim3 blockShape = dim3(features);
-	multiply << <gridShape, blockShape >> > (categories, features, batches, dev_W, dev_b, dev_x, dev_score);
+	int shareMemSize = 1;
+
+
+	multiply << <gridShape, blockShape,0, stream0 >> > (categories, features, batches, dev_W, dev_b, dev_x, dev_score);
 	cudaStatus = cudaGetLastError();
 	if (cudaStatus != cudaSuccess) {
 		fprintf(stderr, "Kernel launch failed: %s\n", cudaGetErrorString(cudaStatus));
 		goto Error;
 	}
-	ONERROR(cudaDeviceSynchronize());
-	update << <batches, categories, categories*sizeof(float) >> > (categories, features, batches, dev_W, dev_b, dev_x, dev_labels, dev_score, learningRate);
+	ONERROR(cudaMemcpyAsync(host_score, dev_score, sizeof(float)*categories*batches, cudaMemcpyDeviceToHost,stream0));
+	ONERROR(cudaStreamSynchronize(stream0));
+
+
+
+
+	update1 << <batches, categories,0, stream0 >> > (categories, features, batches, dev_labels, dev_score, dev_diff);
 
 	cudaStatus = cudaGetLastError();
 	if (cudaStatus != cudaSuccess) {
 		fprintf(stderr, "Kernel launch failed: %s\n", cudaGetErrorString(cudaStatus));
 		goto Error;
 	}
-	ONERROR(cudaDeviceSynchronize());
-	ONERROR(cudaMemcpy(host_score,dev_score, sizeof(float)*categories*batches,cudaMemcpyDeviceToHost));
 
+
+
+
+	update2 << <features, dim3(categories,batches),0, stream0 >> > (categories, features, batches,dev_x, dev_diff, dev_diffW);
+	if (cudaStatus != cudaSuccess) {
+		fprintf(stderr, "Kernel launch failed: %s\n", cudaGetErrorString(cudaStatus));
+		goto Error;
+	}
+
+	update3 << <categories, features,0, stream0 >> >(categories, features, batches, dev_W, dev_b, dev_diff, dev_diffW, learningRate);
+	if (cudaStatus != cudaSuccess) {
+		fprintf(stderr, "Kernel launch failed: %s\n", cudaGetErrorString(cudaStatus));
+		goto Error;
+	}
+
+
+	
 	int correctCount = 0;
 	for (int i = 0; i < batches; i++)
 	{
@@ -152,11 +224,16 @@ cudaError_t updatePara_SGD(float* x, int* label, int batches, float* backPropaga
 		if (maxlabel == label[i])
 			correctCount++;
 	}
+	ONERROR(cudaStreamSynchronize(stream0));
 	delete[] host_score;
 	correctRate[0] = (float)correctCount / batches;
+
 Error:
 	cudaFree(dev_x);
 	cudaFree(dev_labels);
 	cudaFree(dev_score);
+	cudaFree(dev_diff);
+	cudaFree(dev_diffW);
+	cudaStreamDestroy(stream0);
 	return cudaStatus;
 }
